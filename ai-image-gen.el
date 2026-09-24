@@ -2,7 +2,7 @@
 
 ;; Author: Niall FitzGibbon
 ;; Version: 0.1
-;; Package-Requires: ((emacs "29.1") (plz "0.9"))
+;; Package-Requires: ((emacs "29.1") (plz "0.9") (org "9.6"))
 ;; Keywords: multimedia, tools
 
 ;;; Commentary:
@@ -16,8 +16,11 @@
 ;;   seed, steps and guidance and reports the seed of each image.
 ;;
 ;; Providers return decoded image bytes; saving and inserting them is the
-;; caller's business (`ai-image-gen-image-save', `ai-image-gen-insert',
-;; ob-ai-image-gen).
+;; caller's business (`ai-image-gen-image-save', `ai-image-gen-insert').
+;;
+;; The package also provides an Org Babel language, `ai-image-gen', whose
+;; blocks are prompts and whose results are image links; enable it through
+;; `org-babel-load-languages' (see ob-ai-image-gen.el).
 ;;
 ;;   (ai-image-gen-register-provider
 ;;    (ai-image-gen-mlx-create :name "flux2-klein"

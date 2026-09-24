@@ -1,12 +1,16 @@
-;;; ob-ai-image-gen.el --- Org Babel blocks that generate images -*- lexical-binding: t; -*-
+;;; ob-ai-image-gen.el --- Org Babel support for ai-image-gen -*- lexical-binding: t; -*-
 
 ;; Author: Niall FitzGibbon
-;; Version: 0.1
-;; Package-Requires: ((emacs "29.1") (org "9.6") (ai-image-gen "0.1"))
-;; Keywords: multimedia, outlines
+
+;; This file is part of ai-image-gen.
 
 ;;; Commentary:
 
+;; The `ai-image-gen' Babel language.  Org loads this file by name when
+;; the language is enabled:
+;;
+;;   (add-to-list 'org-babel-load-languages '(ai-image-gen . t))
+;;
 ;; The block body is the prompt; the result is a link to the image.
 ;;
 ;;   #+begin_src ai-image-gen :size 768x512 :seed 7

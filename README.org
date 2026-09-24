@@ -1,8 +1,8 @@
 * ai-image-gen
 
 =ai-image-gen= generates images from Emacs through a small registry of
-providers, and =ob-ai-image-gen= makes that available as an Org Babel
-language whose blocks are prompts and whose results are image links.
+providers, and makes that available as an Org Babel language whose blocks
+are prompts and whose results are image links.
 
 Two provider types are built in:
 
@@ -17,7 +17,7 @@ self-signed local endpoints.
 ** Setup
 
 #+begin_src emacs-lisp
-(use-package ob-ai-image-gen
+(use-package ai-image-gen
   :vc (:url "https://github.com/fitzgibbon/ai-image-gen.git")
   :demand t
   :config
@@ -40,6 +40,10 @@ self-signed local endpoints.
 token. When exactly one provider is registered it is the default.
 
 Images without an explicit destination go to =ai-image-gen-directory=.
+
+Enabling the =ai-image-gen= Babel language (the last two lines above) makes
+Org load the Babel support, which lives in =ob-ai-image-gen.el= because Org
+finds a language's support by that name.
 
 ** Org Babel
 
