@@ -19,7 +19,6 @@ self-signed local endpoints.
 #+begin_src emacs-lisp
 (use-package ai-image-gen
   :vc (:url "https://github.com/fitzgibbon/ai-image-gen.git")
-  :demand t
   :config
   (ai-image-gen-register-provider
    (ai-image-gen-mlx-create
