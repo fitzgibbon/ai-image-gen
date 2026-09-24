@@ -12,6 +12,7 @@
 (require 'ai-image-gen)
 (require 'ob-ai-image-gen)
 (require 'org)
+(require 'ox)
 
 (defconst ai-image-gen-tests--png
   (base64-decode-string
@@ -500,6 +501,135 @@
 (ert-deftest ob-ai-image-gen-rejects-bad-sources ()
   (should-error (ob-ai-image-gen-request "x" '((:image . "no-such-thing"))) :type 'user-error)
   (should-error (ob-ai-image-gen-request "x" '((:mask . "no-such-thing"))) :type 'user-error))
+
+;;;; Async Babel
+
+(defmacro ai-image-gen-tests--with-org-buffer (text &rest body)
+  "Run BODY in an Org buffer holding TEXT, with Babel ready and no pending files."
+  (declare (indent 1))
+  `(with-temp-buffer
+     (let ((org-confirm-babel-evaluate nil)
+           (org-babel-load-languages '((ai-image-gen . t)))
+           (ob-ai-image-gen--pending (make-hash-table :test 'equal)))
+       (org-mode)
+       (insert ,text)
+       (goto-char (point-min))
+       ,@body)))
+
+(defun ai-image-gen-tests--result-file ()
+  "Return the file linked from the result of the block at point."
+  (save-excursion
+    (goto-char (org-babel-where-is-src-block-result))
+    (forward-line)
+    (ob-ai-image-gen--link-file-at-point)))
+
+(defun ai-image-gen-tests--png-p (file)
+  "Return non-nil when FILE holds the test PNG."
+  (equal (ai-image-gen--file-bytes file) ai-image-gen-tests--png))
+
+(ert-deftest ob-ai-image-gen-async-links-first-and-fills-later ()
+  (ai-image-gen-tests--with-registry
+    (ai-image-gen-register-provider (ai-image-gen-tests-fake-create :name "fake"))
+    (ai-image-gen-tests--with-org-buffer
+        "#+begin_src ai-image-gen :async yes :seed 3\nA platypus\n#+end_src\n"
+      (org-babel-execute-src-block)
+      (let ((file (ai-image-gen-tests--result-file)))
+        (should (ob-ai-image-gen--pending-p file))
+        (should (file-exists-p file))
+        (should (zerop (file-attribute-size (file-attributes file))))
+        (ai-image-gen-tests--wait-for (lambda () (not (ob-ai-image-gen--pending-p file))))
+        (should (ai-image-gen-tests--png-p file))
+        (should (equal (ai-image-gen-tests--result-file) file))))))
+
+(ert-deftest ob-ai-image-gen-async-failure-replaces-link ()
+  (ai-image-gen-tests--with-registry
+    (ai-image-gen-register-provider (ai-image-gen-tests-fake-create :name "fake" :fail "boom"))
+    (ai-image-gen-tests--with-org-buffer
+        "#+begin_src ai-image-gen :async yes\nA platypus\n#+end_src\n"
+      (org-babel-execute-src-block)
+      (let ((file (ai-image-gen-tests--result-file)))
+        (ai-image-gen-tests--wait-for (lambda () (not (ob-ai-image-gen--pending-p file))))
+        (should-not (file-exists-p file))
+        (should (save-excursion (goto-char (point-min))
+                                (search-forward "ai-image-gen failed: boom" nil t)))))))
+
+(ert-deftest ob-ai-image-gen-async-keeps-an-explicit-file-on-failure ()
+  (ai-image-gen-tests--with-registry
+    (ai-image-gen-register-provider (ai-image-gen-tests-fake-create :name "fake" :fail "boom"))
+    (ai-image-gen-tests--with-source-images (existing)
+      (ai-image-gen-tests--with-org-buffer
+          (format "#+begin_src ai-image-gen :async yes :file %s\nA platypus\n#+end_src\n" existing)
+        (org-babel-execute-src-block)
+        (ai-image-gen-tests--wait-for (lambda () (not (ob-ai-image-gen--pending-p existing))))
+        (should (ai-image-gen-tests--png-p existing))))))
+
+(ert-deftest ob-ai-image-gen-async-edit-waits-for-its-source ()
+  (ai-image-gen-tests--with-registry
+    (let ((fake (ai-image-gen-tests-fake-create :name "fake")))
+      (ai-image-gen-register-provider fake)
+      (ai-image-gen-tests--with-org-buffer
+          (concat "#+name: mascot\n#+begin_src ai-image-gen :async yes\nA platypus\n#+end_src\n\n"
+                  "#+begin_src ai-image-gen :async yes :image mascot\nNow with a wrench\n#+end_src\n")
+        (search-forward "Now with a wrench")
+        (org-babel-execute-src-block)
+        (let* ((edited (ai-image-gen-tests--result-file))
+               (mascot (progn (goto-char (point-min)) (ai-image-gen-tests--result-file))))
+          (should (ob-ai-image-gen--pending-p mascot))
+          (should (ob-ai-image-gen--pending-p edited))
+          (ai-image-gen-tests--wait-for (lambda () (not (ob-ai-image-gen--pending-p edited))))
+          (should (ai-image-gen-tests--png-p mascot))
+          (should (ai-image-gen-tests--png-p edited))
+          (let ((requests (reverse (ai-image-gen-tests-fake-requests fake))))
+            (should (= (length requests) 2))
+            (should-not (ai-image-gen-edit-request-p (car requests)))
+            (should (equal (ai-image-gen-edit-request-images (cadr requests)) (list mascot)))))))))
+
+(ert-deftest ob-ai-image-gen-async-edit-fails-with-its-source ()
+  (ai-image-gen-tests--with-registry
+    (ai-image-gen-register-provider (ai-image-gen-tests-fake-create :name "fake" :fail "boom"))
+    (ai-image-gen-tests--with-org-buffer
+        (concat "#+name: mascot\n#+begin_src ai-image-gen :async yes\nA platypus\n#+end_src\n\n"
+                "#+begin_src ai-image-gen :async yes :image mascot\nNow with a wrench\n#+end_src\n")
+      (search-forward "Now with a wrench")
+      (org-babel-execute-src-block)
+      (let ((edited (ai-image-gen-tests--result-file)))
+        (ai-image-gen-tests--wait-for (lambda () (not (ob-ai-image-gen--pending-p edited))))
+        (should (save-excursion (goto-char (point-min))
+                                (search-forward "source image failed: boom" nil t)))))))
+
+(ert-deftest ob-ai-image-gen-sync-edit-waits-for-a-pending-source ()
+  (ai-image-gen-tests--with-registry
+    (ai-image-gen-register-provider (ai-image-gen-tests-fake-create :name "fake"))
+    (ai-image-gen-tests--with-org-buffer
+        (concat "#+name: mascot\n#+begin_src ai-image-gen :async yes\nA platypus\n#+end_src\n\n"
+                "#+begin_src ai-image-gen :image mascot\nNow with a wrench\n#+end_src\n")
+      (org-babel-execute-src-block)
+      (let ((mascot (ai-image-gen-tests--result-file)))
+        (should (ob-ai-image-gen--pending-p mascot))
+        (search-forward "Now with a wrench")
+        (org-babel-execute-src-block)
+        (should-not (ob-ai-image-gen--pending-p mascot))
+        (should (ai-image-gen-tests--png-p (ai-image-gen-tests--result-file)))))))
+
+(ert-deftest ob-ai-image-gen-export-always-waits ()
+  (ai-image-gen-tests--with-registry
+    (ai-image-gen-register-provider (ai-image-gen-tests-fake-create :name "fake"))
+    (ai-image-gen-tests--with-org-buffer
+        "#+begin_src ai-image-gen :async yes\nA platypus\n#+end_src\n"
+      (let ((org-export-current-backend 'html))
+        (org-babel-execute-src-block))
+      (should (ai-image-gen-tests--png-p (ai-image-gen-tests--result-file))))))
+
+(ert-deftest ob-ai-image-gen-async-default-and-override ()
+  (let ((noninteractive nil)
+        (ob-ai-image-gen-async t))
+    (should (ob-ai-image-gen--async-p nil))
+    (should-not (ob-ai-image-gen--async-p '((:async . "no"))))
+    (let ((org-export-current-backend 'html))
+      (should-not (ob-ai-image-gen--async-p '((:async . "yes"))))))
+  (let ((ob-ai-image-gen-async nil))
+    (should-not (ob-ai-image-gen--async-p nil))
+    (should (ob-ai-image-gen--async-p '((:async . "yes"))))))
 
 ;;;; Live
 

@@ -31,6 +31,10 @@
 ;;
 ;; Several sources are space-separated or a quoted list.  :mask names a PNG
 ;; whose transparent areas mark what to change, for providers that take one.
+;;
+;; Run from a command, a block returns at once with its link and the image
+;; fills it in when it arrives; an edit waits for sources still generating.
+;; Export, :async no and a nil `ob-ai-image-gen-async' make blocks wait.
 
 ;;; Code:
 
@@ -50,8 +54,23 @@
     (steps . :any)
     (guidance . :any)
     (image . :any)
-    (mask . :any))
+    (mask . :any)
+    (async . ((yes no))))
   "Header arguments specific to ai-image-gen blocks.")
+
+(defcustom ob-ai-image-gen-async t
+  "Whether blocks run from a command generate in the background.
+The block's link is written at once and the image fills it in when it
+arrives.  Blocks run during export always wait, since the exported
+document needs the image.  A block's :async header argument overrides
+this."
+  :type 'boolean
+  :group 'ai-image-gen)
+
+(defvar ob-ai-image-gen--pending (make-hash-table :test 'equal)
+  "Files being generated in the background, mapped to their waiters.
+A waiter is called with nil once the file is written, or with an
+error message if generating it failed.")
 
 (defun ob-ai-image-gen--number (params key)
   "Return header argument KEY of PARAMS as a number, or nil."
@@ -131,18 +150,129 @@ With an :image header argument it is an `ai-image-gen-edit-request'."
            :guidance (ob-ai-image-gen--number params :guidance)
            (when images (list :images images :mask mask)))))
 
+(defun ob-ai-image-gen--async-p (params)
+  "Return non-nil when the block with PARAMS should run in the background."
+  (and (not (bound-and-true-p org-export-current-backend))
+       (pcase (cdr (assq :async params))
+         ('nil (and ob-ai-image-gen-async (not noninteractive)))
+         ((or "no" "nil" 'no) nil)
+         (_ t))))
+
+(defun ob-ai-image-gen--pending-p (file)
+  "Return non-nil while FILE is being generated in the background."
+  (not (eq (gethash file ob-ai-image-gen--pending 'absent) 'absent)))
+
+(defun ob-ai-image-gen--when-ready (files callback)
+  "Call CALLBACK once none of FILES is being generated.
+CALLBACK receives nil, or the error message of a source that failed."
+  (let* ((pending (seq-filter #'ob-ai-image-gen--pending-p files))
+         (remaining (length pending))
+         (failure nil))
+    (if (zerop remaining)
+        (funcall callback nil)
+      (dolist (file pending)
+        (push (lambda (message)
+                (setq failure (or failure message))
+                (when (zerop (cl-decf remaining))
+                  (funcall callback failure)))
+              (gethash file ob-ai-image-gen--pending))))))
+
+(defun ob-ai-image-gen--wait-for (files)
+  "Wait until none of FILES is being generated, then check they exist."
+  (with-timeout (ai-image-gen-timeout
+                 (user-error "Timed out waiting for source images"))
+    (while (seq-some #'ob-ai-image-gen--pending-p files)
+      (accept-process-output nil 0.05)))
+  (dolist (file files)
+    (unless (and (file-readable-p file)
+                 (> (file-attribute-size (file-attributes file)) 0))
+      (user-error "Source image %s was not generated" file))))
+
+(defun ob-ai-image-gen--update-links (file failure)
+  "Show the links to FILE in the current buffer, or replace them with FAILURE."
+  (save-excursion
+    (goto-char (point-min))
+    (while (re-search-forward org-link-bracket-re nil t)
+      (let ((beg (match-beginning 0))
+            (end (match-end 0))
+            (link (match-string-no-properties 1)))
+        (when (and (string-prefix-p "file:" link)
+                   (equal (expand-file-name (substring link 5)) file))
+          (if failure
+              (progn
+                (delete-region beg end)
+                (goto-char beg)
+                (insert (format "ai-image-gen failed: %s" failure)))
+            (cond
+             ((fboundp 'org-link-preview-region)
+              (org-link-preview-region nil t beg end))
+             ((fboundp 'org-display-inline-images)
+              (org-display-inline-images nil t beg end)))))))))
+
+(defun ob-ai-image-gen--finish (buffer file failure reserved)
+  "Record that FILE finished, with FAILURE or nil, and update BUFFER.
+RESERVED means FILE is an empty placeholder to delete on failure."
+  (let ((waiters (gethash file ob-ai-image-gen--pending)))
+    (remhash file ob-ai-image-gen--pending)
+    (when (and failure reserved)
+      (ignore-errors (delete-file file)))
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (ob-ai-image-gen--update-links file failure)))
+    (if failure
+        (message "Image generation failed: %s" failure)
+      (message "Generated %s" (abbreviate-file-name file)))
+    (dolist (waiter (reverse waiters))
+      (funcall waiter failure))))
+
+(defun ob-ai-image-gen--start (request provider file sources reserved)
+  "Generate REQUEST with PROVIDER into FILE in the background.
+Wait first for SOURCES that are still being generated.  RESERVED
+means FILE is a fresh name, held by an empty placeholder meanwhile."
+  (let ((buffer (current-buffer)))
+    (when reserved
+      (write-region "" nil file nil 'silent))
+    (puthash file nil ob-ai-image-gen--pending)
+    ;; After Org has written the block's link, so it can be updated.
+    (run-at-time
+     0 nil
+     (lambda ()
+       (ob-ai-image-gen--when-ready
+        sources
+        (lambda (failure)
+          (if failure
+              (ob-ai-image-gen--finish buffer file (format "source image failed: %s" failure)
+                                       reserved)
+            (ai-image-gen-generate
+             request :provider provider
+             :then (lambda (images)
+                     (ai-image-gen-image-save (car images) file)
+                     (ob-ai-image-gen--finish buffer file nil reserved))
+             :else (lambda (message)
+                     (ob-ai-image-gen--finish buffer file message reserved))))))))
+    (message "Generating %s in the background..." (file-name-nondirectory file))
+    file))
+
 (defun org-babel-execute:ai-image-gen (body params)
   "Generate the image described by BODY and return its file.
-With an :image header argument, edit that image instead.
-PARAMS are the block's header arguments."
+With an :image header argument, edit that image instead.  Run from a
+command, the image is generated in the background (see
+`ob-ai-image-gen-async').  PARAMS are the block's header arguments."
   (let* ((request (ob-ai-image-gen-request body params))
-         (image (car (ai-image-gen-generate-sync
-                      request :provider (ob-ai-image-gen--string params :provider))))
-         (file (cdr (assq :file params))))
-    (ai-image-gen-image-save
-     image (if file
-               (expand-file-name file)
-             (ai-image-gen-default-file request image)))))
+         (provider (ai-image-gen-get-provider (ob-ai-image-gen--string params :provider)))
+         (target (when-let* ((file (cdr (assq :file params))))
+                   (expand-file-name file)))
+         (sources (when (ai-image-gen-edit-request-p request)
+                    (append (ai-image-gen-edit-request-images request)
+                            (ensure-list (ai-image-gen-edit-request-mask request))))))
+    (if (ob-ai-image-gen--async-p params)
+        (ob-ai-image-gen--start request provider
+                                (or target (ai-image-gen-default-file request))
+                                sources (not target))
+      (ob-ai-image-gen--wait-for sources)
+      (let ((image (car (ai-image-gen-generate-sync request :provider provider))))
+        (ai-image-gen-image-save
+         image (or target (ai-image-gen-default-file request image)))))))
 
 (defun org-babel-prep-session:ai-image-gen (_session _params)
   "Signal that ai-image-gen blocks have no sessions."
