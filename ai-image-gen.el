@@ -398,23 +398,19 @@ on failure.  Quitting cancels the request."
          (slug (string-join (seq-take words 6) "-")))
     (if (string-empty-p slug) "image" slug)))
 
-(defun ai-image-gen-default-file (request &optional image)
-  "Return a fresh file in `ai-image-gen-directory' for IMAGE of REQUEST.
-Without IMAGE, for naming a file before it exists, the seed comes from
-REQUEST and the extension is png."
+(defun ai-image-gen-default-file (request image)
+  "Return a fresh file in `ai-image-gen-directory' for IMAGE of REQUEST."
   (let ((base (format "%s-%s%s"
                       (format-time-string "%Y%m%d-%H%M%S")
                       (ai-image-gen--slug (ai-image-gen-request-prompt request))
-                      (if-let* ((seed (if image
-                                          (ai-image-gen-image-seed image)
-                                        (ai-image-gen-request-seed request))))
+                      (if-let* ((seed (ai-image-gen-image-seed image)))
                           (format "-s%d" seed)
-                        "")))
-        (extension (if image (ai-image-gen-image-extension image) "png")))
+                        ""))))
     (make-directory ai-image-gen-directory t)
     (cl-loop for i from 0
              for file = (expand-file-name
-                         (format "%s%s.%s" base (if (zerop i) "" (format "-%d" i)) extension)
+                         (format "%s%s.%s" base (if (zerop i) "" (format "-%d" i))
+                                 (ai-image-gen-image-extension image))
                          ai-image-gen-directory)
              unless (file-exists-p file) return file)))
 

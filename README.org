@@ -68,20 +68,7 @@ Header arguments:
 | =:guidance= | guidance scale (=ai-image-gen-mlx= only)                |
 | =:image=    | source image(s) to edit instead of generating           |
 | =:mask=     | PNG marking what to change (=ai-image-gen-openai= only) |
-| =:async=    | =yes= or =no=, overriding =ob-ai-image-gen-async=       |
 | =:file=     | where to save the image                                 |
-
-*** Background generation
-
-Run with =C-c C-c=, a block returns at once: Org writes the result link
-straight away, and the image fills it in (with its inline preview) when it
-arrives, so you can keep working meanwhile. If generation fails, the link is
-replaced by the error.
-
-An edit whose =:image= source is still generating waits for it, then starts,
-so a chain of blocks can be run in one go. Blocks run during export always
-wait, since the exported document needs the image; so do blocks with
-=:async no=, and all blocks when =ob-ai-image-gen-async= is nil.
 
 *** Editing
 
