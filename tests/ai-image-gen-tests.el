@@ -111,13 +111,12 @@
     (should (equal (sort (mapcar #'car body) #'string<) '(n prompt)))))
 
 (ert-deftest ai-image-gen-headers-resolve-key-functions ()
-  (should (equal (alist-get "Authorization"
-                            (ai-image-gen--headers
-                             (ai-image-gen-openai-create :key (lambda () "sk-x")))
-                            nil nil #'equal)
-                 "Bearer sk-x"))
+  (let ((headers (ai-image-gen--headers
+                  (ai-image-gen-openai-create :key (lambda () "sk-x")) "application/json")))
+    (should (equal (alist-get "Authorization" headers nil nil #'equal) "Bearer sk-x"))
+    (should (equal (alist-get "Content-Type" headers nil nil #'equal) "application/json")))
   (should-not (assoc "Authorization"
-                     (ai-image-gen--headers (ai-image-gen-mlx-create)))))
+                     (ai-image-gen--headers (ai-image-gen-mlx-create) "application/json"))))
 
 ;;;; Responses
 
@@ -190,6 +189,167 @@
        #'ignore
        (lambda (message) (setq failure message)))
       (should (equal failure "HTTP 400: height 128 is not supported")))))
+
+;;;; Edits
+
+(defmacro ai-image-gen-tests--with-source-images (names &rest body)
+  "Bind NAMES to fresh PNG files for BODY."
+  (declare (indent 1))
+  `(let ,(mapcar (lambda (name)
+                   `(,name (let ((file (make-temp-file ,(format "ai-image-gen-%s-" name) nil ".png")))
+                             (let ((coding-system-for-write 'binary))
+                               (write-region ai-image-gen-tests--png nil file nil 'silent))
+                             file)))
+                 names)
+     (unwind-protect (progn ,@body)
+       (dolist (file (list ,@names)) (delete-file file)))))
+
+(defun ai-image-gen-tests--multipart-parts (body boundary)
+  "Split multipart BODY on BOUNDARY into (HEADERS . CONTENT) pairs."
+  (let ((delimiter (concat "--" boundary)))
+    (should (string-suffix-p (concat delimiter "--\r\n") body))
+    (mapcar (lambda (part)
+              (let ((split (string-search "\r\n\r\n" part)))
+                (cons (substring part 0 split)
+                      (substring part (+ split 4) (- (length part) 2)))))
+            (seq-filter (lambda (part) (not (member part '("" "--\r\n"))))
+                        (mapcar (lambda (part) (string-remove-prefix "\r\n" part))
+                                (split-string body (regexp-quote delimiter)))))))
+
+(defun ai-image-gen-tests--capture-edit (provider request)
+  "Send REQUEST to PROVIDER with `plz' stubbed; return (URL HEADERS PARTS FAILURE)."
+  (let (url headers body failure)
+    (cl-letf (((symbol-function 'plz)
+               (lambda (_method target &rest args)
+                 (setq url target
+                       headers (plist-get args :headers)
+                       body (plist-get args :body))
+                 (funcall (plist-get args :then)
+                          `((data . [((b64_json . ,(base64-encode-string ai-image-gen-tests--png)))])))
+                 nil)))
+      (ai-image-gen-provider-generate provider request #'ignore
+                                      (lambda (message) (setq failure message))))
+    (list url headers
+          (let ((content-type (alist-get "Content-Type" headers nil nil #'equal)))
+            (when (and body (string-match "boundary=\\(.+\\)" content-type))
+              (should-not (multibyte-string-p body))
+              (ai-image-gen-tests--multipart-parts body (match-string 1 content-type))))
+          failure)))
+
+(defun ai-image-gen-tests--part (parts name)
+  "Return the content of the part called NAME in PARTS."
+  (cdr (seq-find (lambda (part)
+                   (string-match-p (format "name=\"%s\"" (regexp-quote name)) (car part)))
+                 parts)))
+
+(ert-deftest ai-image-gen-edit-request-validates-sources ()
+  (should-error (ai-image-gen-edit-request-create :prompt "x") :type 'user-error)
+  (should-error (ai-image-gen-edit-request-create :prompt "x" :images "/no/such.png")
+                :type 'user-error)
+  (ai-image-gen-tests--with-source-images (source)
+    (should-error (ai-image-gen-edit-request-create :prompt "x" :images source
+                                                    :mask "/no/mask.png")
+                  :type 'user-error)
+    (let ((request (ai-image-gen-edit-request-create :prompt "x" :images source :seed 3)))
+      (should (ai-image-gen-request-p request))
+      (should (equal (ai-image-gen-edit-request-images request) (list source)))
+      (should (equal (ai-image-gen-request-seed request) 3)))))
+
+(ert-deftest ai-image-gen-multipart-keeps-bytes ()
+  (ai-image-gen-tests--with-source-images (source)
+    (let* ((body (ai-image-gen--multipart "B0UND" '(("prompt" . "café") ("n" . 1))
+                                          `(("image" . ,source))))
+           (parts (ai-image-gen-tests--multipart-parts body "B0UND")))
+      (should-not (multibyte-string-p body))
+      (should (= (length parts) 3))
+      (should (equal (decode-coding-string (ai-image-gen-tests--part parts "prompt") 'utf-8) "café"))
+      (should (equal (ai-image-gen-tests--part parts "n") "1"))
+      (should (equal (ai-image-gen-tests--part parts "image") ai-image-gen-tests--png))
+      (should (string-match-p "Content-Type: image/png"
+                              (car (seq-find (lambda (part) (string-match-p "filename=" (car part)))
+                                             parts)))))))
+
+(ert-deftest ai-image-gen-openai-edit-uploads-images-and-mask ()
+  (ai-image-gen-tests--with-source-images (first second mask)
+    (pcase-let ((`(,url ,headers ,parts ,failure)
+                 (ai-image-gen-tests--capture-edit
+                  (ai-image-gen-openai-create :name "o" :url "https://api.example/v1" :model "gpt-image-1")
+                  (ai-image-gen-edit-request-create :prompt "add a hat" :n 2
+                                                    :images (list first second) :mask mask))))
+      (should-not failure)
+      (should (equal url "https://api.example/v1/images/edits"))
+      (should (string-prefix-p "multipart/form-data; boundary="
+                               (alist-get "Content-Type" headers nil nil #'equal)))
+      (should (= (seq-count (lambda (part) (string-match-p "name=\"image\\[\\]\"" (car part))) parts)
+                 2))
+      (should (equal (ai-image-gen-tests--part parts "mask") ai-image-gen-tests--png))
+      (should (equal (ai-image-gen-tests--part parts "prompt") "add a hat"))
+      (should (equal (ai-image-gen-tests--part parts "model") "gpt-image-1"))
+      (should (equal (ai-image-gen-tests--part parts "n") "2")))))
+
+(ert-deftest ai-image-gen-mlx-edit-sends-sampling-without-n ()
+  (ai-image-gen-tests--with-source-images (source)
+    (pcase-let ((`(,url ,_headers ,parts ,failure)
+                 (ai-image-gen-tests--capture-edit
+                  (ai-image-gen-mlx-create :name "m" :url "https://host:1/v1" :model "klein")
+                  (ai-image-gen-edit-request-create :prompt "wrench" :images source
+                                                    :seed 11 :steps 4 :guidance 1.0))))
+      (should-not failure)
+      (should (equal url "https://host:1/v1/images/edits"))
+      (should (ai-image-gen-tests--part parts "image"))
+      (should (equal (ai-image-gen-tests--part parts "seed") "11"))
+      (should (equal (ai-image-gen-tests--part parts "steps") "4"))
+      (should (equal (ai-image-gen-tests--part parts "guidance_scale") "1.0"))
+      (should-not (ai-image-gen-tests--part parts "n")))))
+
+(ert-deftest ai-image-gen-mlx-edit-rejects-mask-and-batches ()
+  (ai-image-gen-tests--with-source-images (source mask)
+    (let ((provider (ai-image-gen-mlx-create :name "m")))
+      (should (string-match-p "mask"
+                              (nth 3 (ai-image-gen-tests--capture-edit
+                                      provider (ai-image-gen-edit-request-create
+                                                :prompt "x" :images source :mask mask)))))
+      (should (string-match-p "one image"
+                              (nth 3 (ai-image-gen-tests--capture-edit
+                                      provider (ai-image-gen-edit-request-create
+                                                :prompt "x" :images source :n 2))))))))
+
+(ert-deftest ai-image-gen-plain-request-still-generates ()
+  (should (equal (car (ai-image-gen-tests--capture-edit
+                       (ai-image-gen-mlx-create :name "m" :url "https://host:1/v1")
+                       (ai-image-gen-request-create :prompt "x")))
+                 "https://host:1/v1/images/generations")))
+
+(defun ai-image-gen-tests--wait-for (predicate)
+  "Spin the event loop until PREDICATE returns non-nil."
+  (with-timeout (5 (error "Timed out waiting"))
+    (while (not (funcall predicate))
+      (accept-process-output nil 0.01))))
+
+(ert-deftest ai-image-gen-edit-command-inserts-after-or-replaces ()
+  (ai-image-gen-tests--with-registry
+    (ai-image-gen-tests--with-source-images (source)
+      (let ((fake (ai-image-gen-tests-fake-create :name "fake")))
+        (ai-image-gen-register-provider fake)
+        (dolist (replace '(nil t))
+          (with-temp-buffer
+            (org-mode)
+            (insert (format "Look: [[file:%s]] done" source))
+            (search-backward "[[file:")
+            (forward-char 3)
+            (ai-image-gen-edit source "add a hat" replace)
+            (ai-image-gen-tests--wait-for
+             (lambda () (save-excursion
+                          (goto-char (point-min))
+                          (search-forward (abbreviate-file-name ai-image-gen-directory) nil t))))
+            (should (= (how-many "\\[\\[file:" (point-min) (point-max)) (if replace 1 2)))
+            (let ((request (car (ai-image-gen-tests-fake-requests fake))))
+              (should (ai-image-gen-edit-request-p request))
+              (should (equal (ai-image-gen-edit-request-images request) (list source))))
+            (goto-char (point-min))
+            (if replace
+                (should-not (search-forward source nil t))
+              (should (search-forward (format "[[file:%s]]\n[[file:" source) nil t)))))))))
 
 ;;;; Entry points
 
@@ -268,6 +428,79 @@
 (ert-deftest ob-ai-image-gen-rejects-empty-prompt ()
   (should-error (ob-ai-image-gen-request "  \n" nil) :type 'user-error))
 
+(ert-deftest ob-ai-image-gen-edits-a-file ()
+  (ai-image-gen-tests--with-registry
+    (ai-image-gen-tests--with-source-images (source)
+      (let ((fake (ai-image-gen-tests-fake-create :name "fake")))
+        (ai-image-gen-register-provider fake)
+        (ai-image-gen-tests--execute
+         (format "#+begin_src ai-image-gen :image %s :seed 4\nAdd a hat\n#+end_src\n" source))
+        (let ((request (car (ai-image-gen-tests-fake-requests fake))))
+          (should (ai-image-gen-edit-request-p request))
+          (should (equal (ai-image-gen-edit-request-images request) (list source)))
+          (should (equal (ai-image-gen-request-prompt request) "Add a hat")))))))
+
+(ert-deftest ob-ai-image-gen-edits-a-named-block-without-rerunning-it ()
+  (ai-image-gen-tests--with-registry
+    (let ((fake (ai-image-gen-tests-fake-create :name "fake")))
+      (ai-image-gen-register-provider fake)
+      (with-temp-buffer
+        (let ((org-confirm-babel-evaluate nil)
+              (org-babel-load-languages '((ai-image-gen . t))))
+          (org-mode)
+          (insert "#+name: mascot\n#+begin_src ai-image-gen :seed 7\nA platypus\n#+end_src\n\n"
+                  "#+begin_src ai-image-gen :image mascot\nNow with a wrench\n#+end_src\n")
+          (goto-char (point-min))
+          (org-babel-execute-src-block)
+          (let ((mascot (progn (goto-char (org-babel-where-is-src-block-result))
+                               (forward-line)
+                               (ob-ai-image-gen--link-file-at-point))))
+            (should (file-exists-p mascot))
+            (search-forward "Now with a wrench")
+            (org-babel-execute-src-block)
+            (should (= (length (ai-image-gen-tests-fake-requests fake)) 2))
+            (should (equal (ai-image-gen-edit-request-images
+                            (car (ai-image-gen-tests-fake-requests fake)))
+                           (list mascot)))))))))
+
+(ert-deftest ob-ai-image-gen-runs-a-named-block-with-no-result ()
+  (ai-image-gen-tests--with-registry
+    (let ((fake (ai-image-gen-tests-fake-create :name "fake")))
+      (ai-image-gen-register-provider fake)
+      (with-temp-buffer
+        (let ((org-confirm-babel-evaluate nil)
+              (org-babel-load-languages '((ai-image-gen . t))))
+          (org-mode)
+          (insert "#+name: mascot\n#+begin_src ai-image-gen\nA platypus\n#+end_src\n\n"
+                  "#+begin_src ai-image-gen :image mascot\nNow with a wrench\n#+end_src\n")
+          (search-backward "Now with a wrench")
+          (org-babel-execute-src-block)
+          (let ((requests (ai-image-gen-tests-fake-requests fake)))
+            (should (= (length requests) 2))
+            (should-not (ai-image-gen-edit-request-p (cadr requests)))
+            (should (ai-image-gen-edit-request-p (car requests)))))))))
+
+(ert-deftest ob-ai-image-gen-edits-a-named-link-and-several-sources ()
+  (ai-image-gen-tests--with-registry
+    (ai-image-gen-tests--with-source-images (logo photo)
+      (let ((fake (ai-image-gen-tests-fake-create :name "fake")))
+        (ai-image-gen-register-provider fake)
+        (with-temp-buffer
+          (let ((org-confirm-babel-evaluate nil)
+                (org-babel-load-languages '((ai-image-gen . t))))
+            (org-mode)
+            (insert (format "#+name: logo\n[[file:%s]]\n\n#+begin_src ai-image-gen :image logo %s\nCombine them\n#+end_src\n"
+                            logo photo))
+            (search-backward "Combine them")
+            (org-babel-execute-src-block)))
+        (should (equal (ai-image-gen-edit-request-images
+                        (car (ai-image-gen-tests-fake-requests fake)))
+                       (list logo photo)))))))
+
+(ert-deftest ob-ai-image-gen-rejects-bad-sources ()
+  (should-error (ob-ai-image-gen-request "x" '((:image . "no-such-thing"))) :type 'user-error)
+  (should-error (ob-ai-image-gen-request "x" '((:mask . "no-such-thing"))) :type 'user-error))
+
 ;;;; Live
 
 (ert-deftest ai-image-gen-live-mlx ()
@@ -288,7 +521,22 @@
       (should-error (ai-image-gen-generate-sync
                      (ai-image-gen-request-create :prompt "x" :size "4096x128")
                      :provider provider)
-                    :type 'ai-image-gen-error))))
+                    :type 'ai-image-gen-error)
+      (let ((source (make-temp-file "ai-image-gen-live-" nil ".png")))
+        (unwind-protect
+            (let ((edited (progn
+                            (ai-image-gen-image-save (car images) source)
+                            (ai-image-gen-generate-sync
+                             (ai-image-gen-edit-request-create
+                              :prompt "the same platypus mascot, now wearing a red scarf"
+                              :images source :seed 7)
+                             :provider provider))))
+              (should (= (length edited) 1))
+              (should (equal (ai-image-gen-image-mime-type (car edited)) "image/png"))
+              (should (equal (ai-image-gen-image-seed (car edited)) 7))
+              (should-not (equal (ai-image-gen-image-data (car edited))
+                                 (ai-image-gen-image-data (car images)))))
+          (delete-file source))))))
 
 (provide 'ai-image-gen-tests)
 ;;; ai-image-gen-tests.el ends here

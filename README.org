@@ -59,14 +59,40 @@ A platypus in a yellow hard hat giving a thumbs up, flat vector illustration
 
 Header arguments:
 
-| argument    | meaning                                              |
-|-------------+------------------------------------------------------|
-| =:provider= | registered provider name (default provider if unset) |
-| =:size=     | =WIDTHxHEIGHT=                                       |
-| =:seed=     | seed (=ai-image-gen-mlx= only)                       |
-| =:steps=    | inference steps (=ai-image-gen-mlx= only)            |
-| =:guidance= | guidance scale (=ai-image-gen-mlx= only)             |
-| =:file=     | where to save the image                              |
+| argument    | meaning                                                 |
+|-------------+---------------------------------------------------------|
+| =:provider= | registered provider name (default provider if unset)    |
+| =:size=     | =WIDTHxHEIGHT=                                          |
+| =:seed=     | seed (=ai-image-gen-mlx= only)                          |
+| =:steps=    | inference steps (=ai-image-gen-mlx= only)               |
+| =:guidance= | guidance scale (=ai-image-gen-mlx= only)                |
+| =:image=    | source image(s) to edit instead of generating           |
+| =:mask=     | PNG marking what to change (=ai-image-gen-openai= only) |
+| =:file=     | where to save the image                                 |
+
+*** Editing
+
+With =:image=, a block edits a source image instead of generating from
+nothing. A source is a file name, the name of another block (whose result
+is used) or the name of a link:
+
+#+begin_example
+,#+name: mascot
+,#+begin_src ai-image-gen :seed 21 :size 768x512
+A cheerful platypus in a yellow hard hat, flat vector illustration
+,#+end_src
+
+,#+begin_src ai-image-gen :image mascot :seed 21
+The same platypus, now riding a small red bicycle
+,#+end_src
+#+end_example
+
+The second block edits whatever the first one last produced; a named block
+with no result yet is run first. Re-running the first block changes what the
+second edits.
+
+Several sources are space-separated (=:image mascot ~/logo.png=) or a quoted
+list (=:image '(mascot "~/a b.png")=). =:mask= takes the same kinds of source.
 
 ** Commands
 
@@ -75,6 +101,10 @@ default), generates asynchronously and inserts a reference at point: an Org
 link with an inline preview in Org buffers, an inline MML image part in
 message buffers, the file name elsewhere. With a prefix argument it asks
 which provider to use.
+
+=M-x ai-image-gen-edit= edits the image linked at point (or one read from the
+minibuffer) as a prompt describes, and puts a link to the result on the line
+after the original. With a prefix argument it replaces the original link.
 
 ** Lisp API
 
@@ -94,6 +124,21 @@ which provider to use.
 instead, signalling =ai-image-gen-error= on failure. Each image carries its
 bytes, sniffed MIME type and, where the provider reports one, its seed.
 
+An edit is a different request type passed to the same functions; the
+OpenAI-compatible providers send it to =/v1/images/edits=:
+
+#+begin_src emacs-lisp
+(ai-image-gen-generate-sync
+ (ai-image-gen-edit-request-create
+  :prompt "the same platypus, now holding a wrench"
+  :images "~/Pictures/mascot.png"
+  :seed 21))
+#+end_src
+
+=ai-image-gen-edit-request-create= checks that every source (and the mask)
+is readable. =ai-image-gen-mlx= rejects a mask and =:n= above 1, since
+mlx-openai-server's edits take neither.
+
 ** Adding a provider
 
 A provider is a struct that includes =ai-image-gen-provider= and implements
@@ -109,6 +154,9 @@ A provider is a struct that includes =ai-image-gen-provider= and implements
   ;; Return the request process (or nil) so callers can cancel it.
   )
 #+end_src
+
+To support edits, add a method that also specialises the request on
+=ai-image-gen-edit-request=.
 
 Providers speaking a variant of the OpenAI API can instead include
 =ai-image-gen-openai= and specialise =ai-image-gen-openai--body=, as

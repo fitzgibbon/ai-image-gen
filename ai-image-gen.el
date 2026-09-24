@@ -15,8 +15,13 @@
 ;; - `ai-image-gen-mlx': mlx-openai-server's variant of it, which also takes
 ;;   seed, steps and guidance and reports the seed of each image.
 ;;
+;; An `ai-image-gen-edit-request' edits source images instead of
+;; generating from nothing; the same entry points take both, and the
+;; OpenAI-compatible providers send edits to /v1/images/edits.
+;;
 ;; Providers return decoded image bytes; saving and inserting them is the
-;; caller's business (`ai-image-gen-image-save', `ai-image-gen-insert').
+;; caller's business (`ai-image-gen-image-save', `ai-image-gen-insert',
+;; `ai-image-gen-edit').
 ;;
 ;; The package also provides an Org Babel language, `ai-image-gen', whose
 ;; blocks are prompts and whose results are image links; enable it through
@@ -69,6 +74,31 @@ first request."
   (seed nil :type (or null natnum) :documentation "Seed of the first image.")
   (steps nil :type (or null natnum) :documentation "Inference steps.")
   (guidance nil :type (or null number) :documentation "Guidance scale."))
+
+(cl-defstruct (ai-image-gen-edit-request
+               (:include ai-image-gen-request)
+               (:constructor ai-image-gen-edit-request--create)
+               (:copier nil))
+  "An edit of one or more source images.
+Build it with `ai-image-gen-edit-request-create', which checks the files."
+  (images nil :type list :documentation "Absolute source image files, at least one.")
+  (mask nil :type (or null string) :documentation "PNG whose transparent areas mark what to change."))
+
+(cl-defun ai-image-gen-edit-request-create (&rest args &key images mask &allow-other-keys)
+  "Return an `ai-image-gen-edit-request' of IMAGES with optional MASK.
+IMAGES is a file name or a non-empty list of them.  The remaining
+ARGS are the `ai-image-gen-request' fields."
+  (let* ((images (mapcar #'expand-file-name (ensure-list images)))
+         (mask (and mask (expand-file-name mask))))
+    (unless images
+      (user-error "An image edit needs at least one source image"))
+    (dolist (file (if mask (cons mask images) images))
+      (unless (file-readable-p file)
+        (user-error "Cannot read image %s" file)))
+    (apply #'ai-image-gen-edit-request--create
+           :images images :mask mask
+           (cl-loop for (key value) on args by #'cddr
+                    unless (memq key '(:images :mask)) append (list key value)))))
 
 (cl-defstruct (ai-image-gen-image
                (:constructor ai-image-gen-image-create)
@@ -171,14 +201,23 @@ cancels the request.")
                       (when-let* ((guidance (ai-image-gen-request-guidance request)))
                         `(guidance_scale . ,guidance))))))
 
+(cl-defmethod ai-image-gen-openai--body ((_provider ai-image-gen-mlx)
+                                         (request ai-image-gen-edit-request))
+  ;; mlx-openai-server edits take neither a mask nor a batch size.
+  (when (ai-image-gen-edit-request-mask request)
+    (signal 'ai-image-gen-error '("mlx-openai-server edits do not take a mask")))
+  (unless (eql (ai-image-gen-request-n request) 1)
+    (signal 'ai-image-gen-error '("mlx-openai-server edits return one image per request")))
+  (assq-delete-all 'n (cl-call-next-method)))
+
 (defun ai-image-gen--resolve-key (key)
   "Return KEY, calling it first when it is a function."
   (if (functionp key) (funcall key) key))
 
-(defun ai-image-gen--headers (provider)
-  "Return request headers for PROVIDER."
+(defun ai-image-gen--headers (provider content-type)
+  "Return request headers for PROVIDER sending CONTENT-TYPE."
   (let ((key (ai-image-gen--resolve-key (ai-image-gen-openai-key provider))))
-    `(("Content-Type" . "application/json")
+    `(("Content-Type" . ,content-type)
       ,@(when (and key (not (string-empty-p key)))
           `(("Authorization" . ,(concat "Bearer " key)))))))
 
@@ -233,12 +272,44 @@ cancels the request.")
      (curl (format "curl error %s: %s" (car curl) (cdr curl)))
      (t (or (plz-error-message err) "unknown error")))))
 
-(cl-defmethod ai-image-gen-provider-generate ((provider ai-image-gen-openai) request then else)
-  (plz 'post (concat (string-remove-suffix "/" (ai-image-gen-openai-url provider))
-                     "/images/generations")
-    :headers (ai-image-gen--headers provider)
-    :body (encode-coding-string
-           (json-encode (ai-image-gen-openai--body provider request)) 'utf-8)
+(defun ai-image-gen--file-bytes (file)
+  "Return the contents of FILE as a unibyte string."
+  (with-temp-buffer
+    (set-buffer-multibyte nil)
+    (insert-file-contents-literally file)
+    (buffer-string)))
+
+(defun ai-image-gen--multipart (boundary fields files)
+  "Return a multipart/form-data body as a unibyte string.
+BOUNDARY separates the parts.  FIELDS is an alist of name to value,
+sent as text; FILES an alist of name to file name, sent as bytes."
+  (let ((text (lambda (&rest parts) (encode-coding-string (apply #'concat parts) 'utf-8))))
+    (apply #'concat
+           (append
+            (mapcar (lambda (field)
+                      (funcall text "--" boundary "\r\n"
+                               "Content-Disposition: form-data; name=\"" (car field) "\"\r\n\r\n"
+                               (format "%s" (cdr field)) "\r\n"))
+                    fields)
+            (mapcan (lambda (file)
+                      (list (funcall text "--" boundary "\r\n"
+                                     "Content-Disposition: form-data; name=\"" (car file)
+                                     "\"; filename=\"" (file-name-nondirectory (cdr file)) "\"\r\n"
+                                     "Content-Type: "
+                                     (or (mailcap-file-name-to-mime-type (cdr file))
+                                         "application/octet-stream")
+                                     "\r\n\r\n")
+                            (ai-image-gen--file-bytes (cdr file))
+                            (funcall text "\r\n")))
+                    files)
+            (list (funcall text "--" boundary "--\r\n"))))))
+
+(defun ai-image-gen--post (provider path content-type body then else)
+  "POST BODY of CONTENT-TYPE to PATH under PROVIDER's URL.
+Call THEN with the decoded images or ELSE with an error message."
+  (plz 'post (concat (string-remove-suffix "/" (ai-image-gen-openai-url provider)) path)
+    :headers (ai-image-gen--headers provider content-type)
+    :body body
     :body-type 'binary
     :as #'json-read
     :timeout ai-image-gen-timeout
@@ -248,10 +319,40 @@ cancels the request.")
               (ai-image-gen-error (funcall else (cadr err)))))
     :else (lambda (err) (funcall else (ai-image-gen--plz-error-message err)))))
 
+(cl-defmethod ai-image-gen-provider-generate ((provider ai-image-gen-openai) request then else)
+  (condition-case err
+      (ai-image-gen--post
+       provider "/images/generations" "application/json"
+       (encode-coding-string (json-encode (ai-image-gen-openai--body provider request)) 'utf-8)
+       then else)
+    (ai-image-gen-error (funcall else (cadr err)) nil)))
+
+(cl-defmethod ai-image-gen-provider-generate ((provider ai-image-gen-openai)
+                                              (request ai-image-gen-edit-request)
+                                              then else)
+  (condition-case err
+      (let* ((boundary (format "ai-image-gen-%s" (md5 (format "%s%s" (float-time) (random)))))
+             (images (ai-image-gen-edit-request-images request))
+             (image-field (if (cdr images) "image[]" "image"))
+             (files (append (mapcar (lambda (file) (cons image-field file)) images)
+                            (when-let* ((mask (ai-image-gen-edit-request-mask request)))
+                              (list (cons "mask" mask))))))
+        (ai-image-gen--post
+         provider "/images/edits"
+         (concat "multipart/form-data; boundary=" boundary)
+         (ai-image-gen--multipart
+          boundary
+          (mapcar (lambda (field) (cons (symbol-name (car field)) (cdr field)))
+                  (ai-image-gen-openai--body provider request))
+          files)
+         then else))
+    (ai-image-gen-error (funcall else (cadr err)) nil)))
+
 ;;;; Entry points
 
 (cl-defun ai-image-gen-generate (request &key provider then else)
   "Generate REQUEST asynchronously with PROVIDER (a name or object).
+An `ai-image-gen-edit-request' edits its source images instead.
 THEN receives a list of `ai-image-gen-image'; ELSE an error message.
 ELSE defaults to reporting the error with `message'."
   (cl-check-type request ai-image-gen-request)
@@ -350,23 +451,83 @@ prefix argument, choose the PROVIDER."
                       (when (use-region-p)
                         (buffer-substring-no-properties (region-beginning) (region-end))))
          (when current-prefix-arg (ai-image-gen-read-provider "Provider: "))))
-  (let ((marker (point-marker))
-        (request (ai-image-gen-request-create :prompt prompt)))
-    (set-marker-insertion-type marker t)
+  (ai-image-gen--generate-at (ai-image-gen-request-create :prompt prompt)
+                             provider (point) nil))
+
+(declare-function org-element-context "org-element" (&optional element))
+(declare-function org-element-lineage "org-element-ast" (datum &optional types with-self))
+(declare-function org-element-property "org-element-ast" (property node &optional dflt force-undefer))
+
+(defun ai-image-gen--image-at-point ()
+  "Return (FILE BEG END) for the image file referenced at point, or nil.
+In Org buffers this is a file link; elsewhere a file name."
+  (or (when (derived-mode-p 'org-mode)
+        (when-let* ((link (org-element-lineage (org-element-context) '(link) t))
+                    ((equal (org-element-property :type link) "file")))
+          (list (expand-file-name (org-element-property :path link))
+                (org-element-property :begin link)
+                (save-excursion
+                  (goto-char (org-element-property :end link))
+                  (skip-chars-backward " \t\n")
+                  (point)))))
+      (when-let* ((bounds (bounds-of-thing-at-point 'filename))
+                  (file (expand-file-name
+                         (buffer-substring-no-properties (car bounds) (cdr bounds))))
+                  ((file-regular-p file)))
+        (list file (car bounds) (cdr bounds)))))
+
+;;;###autoload
+(defun ai-image-gen-edit (source prompt &optional replace provider)
+  "Edit image SOURCE as PROMPT describes and insert a reference to the result.
+Interactively SOURCE is the image linked at point, or read from the
+minibuffer.  The result goes on the line after the reference at
+point; with a prefix argument it REPLACEs the reference.  PROVIDER
+defaults to `ai-image-gen-default-provider'."
+  (interactive
+   (let ((source (or (car (ai-image-gen--image-at-point))
+                     (read-file-name "Image to edit: " nil nil t))))
+     (list source
+           (read-string (format "Edit %s: " (file-name-nondirectory source)))
+           current-prefix-arg)))
+  (let* ((request (ai-image-gen-edit-request-create :prompt prompt :images source))
+         (at-point (ai-image-gen--image-at-point))
+         (reference (and at-point
+                         (equal (car at-point) (car (ai-image-gen-edit-request-images request)))
+                         (cdr at-point))))
+    (cond
+     ((and replace reference)
+      (ai-image-gen--generate-at request provider (car reference) (cadr reference)))
+     (reference
+      (ai-image-gen--generate-at request provider (cadr reference) nil "\n"))
+     (t (ai-image-gen--generate-at request provider (point) nil)))))
+
+(defun ai-image-gen--generate-at (request provider position replace-end &optional prefix)
+  "Generate REQUEST with PROVIDER and insert a reference at POSITION.
+When REPLACE-END is non-nil, the text from POSITION to it is replaced.
+PREFIX is inserted before the reference."
+  (let ((start (copy-marker position))
+        (end (and replace-end (copy-marker replace-end t))))
     (message "Generating image...")
     (ai-image-gen-generate
      request :provider provider
      :then (lambda (images)
              (let ((file (ai-image-gen-image-save
                           (car images) (ai-image-gen-default-file request (car images)))))
-               (if (buffer-live-p (marker-buffer marker))
-                   (with-current-buffer (marker-buffer marker)
+               (if (buffer-live-p (marker-buffer start))
+                   (with-current-buffer (marker-buffer start)
                      (save-excursion
-                       (goto-char marker)
+                       (when end (delete-region start end))
+                       (goto-char start)
+                       (when prefix (insert prefix))
                        (ai-image-gen--insert-link file))
                      (message "Generated %s" (abbreviate-file-name file)))
                  (message "Generated %s (buffer gone)" (abbreviate-file-name file)))
-               (set-marker marker nil))))))
+               (set-marker start nil)
+               (when end (set-marker end nil))))
+     :else (lambda (message)
+             (set-marker start nil)
+             (when end (set-marker end nil))
+             (message "Image generation failed: %s" message)))))
 
 (provide 'ai-image-gen)
 ;;; ai-image-gen.el ends here
